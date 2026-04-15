@@ -25,17 +25,17 @@ import (
 // EpcisRecord はチェーン上に保存する EPCIS イベントの簡略表現。
 // 完全な EPCIS JSON は data_hash でオフチェーンと紐付ける。
 type EpcisRecord struct {
-	IdempotencyKey string `json:"idempotency_key"`
-	DataHash       string `json:"data_hash"`
-	ChainHash      string `json:"chain_hash"`
-	ParentTx       string `json:"parent_tx,omitempty"`
-	EventTime      string `json:"event_time"`
-	BizStep        string `json:"biz_step"`
-	SourceCloud    string `json:"source_cloud"`
-	IsImputed      bool   `json:"is_imputed"`
+	IdempotencyKey  string `json:"idempotency_key"`
+	DataHash        string `json:"data_hash"`
+	ChainHash       string `json:"chain_hash"`
+	ParentTx        string `json:"parent_tx,omitempty"`
+	EventTime       string `json:"event_time"`
+	BizStep         string `json:"biz_step"`
+	SourceCloud     string `json:"source_cloud"`
+	IsImputed       bool   `json:"is_imputed"`
 	RepairModelHash string `json:"repair_model_hash,omitempty"`
-	RecordedAt     string `json:"recorded_at"`
-	TxID           string `json:"tx_id"`
+	RecordedAt      string `json:"recorded_at"`
+	TxID            string `json:"tx_id"`
 }
 
 // ── スマートコントラクト ──────────────────────────────────────────────────
@@ -48,8 +48,9 @@ type EpcisChaincode struct {
 // CreateEpcisEvent は EPCIS イベントをチェーンに追記する。
 //
 // 引数:
-//   idempotencyKey : 重複防止キー (SHA256 先頭16文字)
-//   epcisEventJSON : 完全な EPCIS 2.0 JSON 文字列
+//
+//	idempotencyKey : 重複防止キー (SHA256 先頭16文字)
+//	epcisEventJSON : 完全な EPCIS 2.0 JSON 文字列
 //
 // 戻り値: トランザクション ID (hex 文字列)
 //
@@ -76,13 +77,13 @@ func (c *EpcisChaincode) CreateEpcisEvent(
 		return "", fmt.Errorf("EPCIS JSON パースエラー: %w", err)
 	}
 
-	dataHash,    _ := epcisMap["data_hash"].(string)
-	chainHash,   _ := epcisMap["chain_hash"].(string)
-	parentTx,    _ := epcisMap["parentTx"].(string)
-	eventTime,   _ := epcisMap["eventTime"].(string)
-	bizStep,     _ := epcisMap["bizStep"].(string)
+	dataHash, _ := epcisMap["data_hash"].(string)
+	chainHash, _ := epcisMap["chain_hash"].(string)
+	parentTx, _ := epcisMap["parentTx"].(string)
+	eventTime, _ := epcisMap["eventTime"].(string)
+	bizStep, _ := epcisMap["bizStep"].(string)
 	sourceCloud, _ := epcisMap["source_cloud"].(string)
-	isImputed,   _ := epcisMap["is_imputed"].(bool)
+	isImputed, _ := epcisMap["is_imputed"].(bool)
 
 	repairModelHash := ""
 	if rm, ok := epcisMap["repair_metadata"].(map[string]interface{}); ok {
