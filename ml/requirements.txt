@@ -1,0 +1,19 @@
+# ml/ ディレクトリの Python 依存パッケージ
+# pip install -r requirements.txt
+# Google Colab の場合: !pip install -r requirements.txt
+
+# データ処理・分析
+pandas>=2.1.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+
+# 深層学習 (PyTorch)
+torch>=2.1.0
+
+# ONNX 関連 (エクスポート・推論用)
+onnx>=1.15.0
+onnxruntime>=1.16.0
+onnxscript>=0.1.0
+
+# 可視化
+matplotlib>=3.7.0
