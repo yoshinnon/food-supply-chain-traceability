@@ -1,0 +1,329 @@
+# .github/workflows/ci-cd.yml
+# ============================================================
+# TraceabilitySystem CI/CD パイプライン
+#
+# ジョブ構成:
+#   test        → dotnet test (Unit / Integration / Schema / E2E)
+#   build-lambda → Lambda デプロイパッケージ作成 & S3 アップロード
+#   build-func  → Azure Functions デプロイパッケージ作成
+#   terraform   → terraform plan (PR) / apply (main)
+#   deploy-lambda → Lambda 関数更新
+#   deploy-func → Azure Functions デプロイ
+#   verify-model → ONNX_MODEL_HASH の両クラウド一致確認
+#
+# 必要な GitHub Secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID (OIDC)
+#   TF_BACKEND_BUCKET, TF_LOCK_TABLE
+#   DB_PASSWORD, FABRIC_ADMIN_PASSWORD
+# ============================================================
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  DOTNET_VERSION: "8.0.x"
+  AWS_REGION: "us-east-1"
+  AZURE_REGION: "japaneast"
+  ARTIFACT_BUCKET: "traceability-lambda-artifacts"
+
+# ════════════════════════════════════════════════════════════════════════════
+# Job 1: テスト
+# ════════════════════════════════════════════════════════════════════════════
+jobs:
+  test:
+    name: "dotnet test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: .NET セットアップ
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 依存パッケージ復元
+        run: dotnet restore
+
+      - name: ビルド
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Unit テスト
+        run: |
+          dotnet test tests/Traceability.Tests/ \
+            --no-build --configuration Release \
+            --filter "FullyQualifiedName~UnitConverterTests|FullyQualifiedName~HashUtil|FullyQualifiedName~MappingTests|FullyQualifiedName~AiRepairService" \
+            --logger "trx;LogFileName=unit-test-results.trx" \
+            --results-directory ./test-results
+
+      - name: Integration テスト
+        run: |
+          dotnet test tests/Traceability.Tests/ \
+            --no-build --configuration Release \
+            --filter "FullyQualifiedName~Integration|FullyQualifiedName~Schema|FullyQualifiedName~EndToEnd" \
+            --logger "trx;LogFileName=integration-test-results.trx" \
+            --results-directory ./test-results
+
+      - name: テスト結果アップロード
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: ./test-results/*.trx
+
+# ════════════════════════════════════════════════════════════════════════════
+# Job 2: Lambda パッケージビルド
+# ════════════════════════════════════════════════════════════════════════════
+  build-lambda:
+    name: "Lambda ビルド & S3 アップロード"
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Lambda パッケージ作成
+        run: |
+          dotnet publish src/Traceability.AWS.Lambda/ \
+            --configuration Release \
+            --runtime linux-x64 \
+            --self-contained false \
+            --output ./publish/lambda
+          cd ./publish/lambda && zip -r ../../traceability-lambda.zip .
+
+      - name: AWS 認証
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: S3 アップロード
+        run: |
+          ENV="${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}"
+          aws s3 cp traceability-lambda.zip \
+            s3://${{ env.ARTIFACT_BUCKET }}/lambda/${ENV}/traceability.zip \
+            --sse aws:kms
+
+      - name: アーティファクト保存
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-package
+          path: traceability-lambda.zip
+
+# ════════════════════════════════════════════════════════════════════════════
+# Job 3: Azure Functions パッケージビルド
+# ════════════════════════════════════════════════════════════════════════════
+  build-func:
+    name: "Azure Functions ビルド"
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Functions パッケージ作成
+        run: |
+          dotnet publish src/Traceability.Azure.Function/ \
+            --configuration Release \
+            --output ./publish/func
+          cd ./publish/func && zip -r ../../traceability-func.zip .
+
+      - name: アーティファクト保存
+        uses: actions/upload-artifact@v4
+        with:
+          name: func-package
+          path: traceability-func.zip
+
+# ════════════════════════════════════════════════════════════════════════════
+# Job 4: Terraform plan / apply
+# ════════════════════════════════════════════════════════════════════════════
+  terraform:
+    name: "Terraform ${{ github.event_name == 'pull_request' && 'Plan' || 'Apply' }}"
+    runs-on: ubuntu-latest
+    needs: [build-lambda, build-func]
+    environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'development' }}
+
+    permissions:
+      id-token: write   # OIDC フェデレーション用
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AWS 認証 (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Azure 認証 (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform セットアップ
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: terraform validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: terraform plan
+        working-directory: terraform
+        run: |
+          ENV="${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}"
+          terraform plan \
+            -var="environment=${ENV}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="azure_region=${{ env.AZURE_REGION }}" \
+            -var="azure_subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            -var="azure_tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="fabric_admin_password=${{ secrets.FABRIC_ADMIN_PASSWORD }}" \
+            -out=tfplan
+
+      - name: terraform apply
+        working-directory: terraform
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve tfplan
+
+# ════════════════════════════════════════════════════════════════════════════
+# Job 5: Lambda デプロイ
+# ════════════════════════════════════════════════════════════════════════════
+  deploy-lambda:
+    name: "Lambda デプロイ"
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: AWS 認証
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Lambda 関数コード更新
+        run: |
+          aws lambda update-function-code \
+            --function-name traceability-processor-prod \
+            --s3-bucket ${{ env.ARTIFACT_BUCKET }} \
+            --s3-key lambda/prod/traceability.zip
+
+          # 更新完了を待機
+          aws lambda wait function-updated \
+            --function-name traceability-processor-prod
+
+          aws lambda update-function-code \
+            --function-name traceability-geofence-prod \
+            --s3-bucket ${{ env.ARTIFACT_BUCKET }} \
+            --s3-key lambda/prod/traceability.zip
+
+# ════════════════════════════════════════════════════════════════════════════
+# Job 6: Azure Functions デプロイ
+# ════════════════════════════════════════════════════════════════════════════
+  deploy-func:
+    name: "Azure Functions デプロイ"
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: アーティファクト取得
+        uses: actions/download-artifact@v4
+        with:
+          name: func-package
+
+      - name: Azure 認証
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Functions デプロイ
+        uses: azure/functions-action@v1
+        with:
+          app-name:    func-traceability-prod
+          package:     traceability-func.zip
+          respect-pom-xml: false
+
+# ════════════════════════════════════════════════════════════════════════════
+# Job 7: ONNX モデルハッシュ一致確認
+# ════════════════════════════════════════════════════════════════════════════
+  verify-model:
+    name: "ONNX_MODEL_HASH 両クラウド一致確認"
+    runs-on: ubuntu-latest
+    needs: [deploy-lambda, deploy-func]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: AWS 認証
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Azure 認証
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ハッシュ取得・比較
+        run: |
+          # AWS Lambda から ONNX_MODEL_HASH を取得
+          AWS_HASH=$(aws lambda get-function-configuration \
+            --function-name traceability-processor-prod \
+            --query 'Environment.Variables.ONNX_MODEL_HASH' \
+            --output text)
+
+          # Azure Functions から ONNX_MODEL_HASH を取得
+          AZURE_HASH=$(az functionapp config appsettings list \
+            --name func-traceability-prod \
+            --resource-group rg-traceability-prod \
+            --query "[?name=='ONNX_MODEL_HASH'].value | [0]" \
+            --output tsv)
+
+          echo "AWS   ONNX_MODEL_HASH: ${AWS_HASH:0:16}..."
+          echo "Azure ONNX_MODEL_HASH: ${AZURE_HASH:0:16}..."
+
+          if [ "$AWS_HASH" != "$AZURE_HASH" ]; then
+            echo "❌ ハッシュ不一致! AWS と Azure で異なる ONNX モデルが設定されています。"
+            exit 1
+          fi
+
+          echo "✅ ONNX_MODEL_HASH 一致確認 OK: ${AWS_HASH:0:16}..."
